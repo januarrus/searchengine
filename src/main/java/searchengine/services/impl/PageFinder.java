@@ -8,14 +8,11 @@ import org.jsoup.select.Elements;
 import searchengine.config.Connection;
 import searchengine.model.Page;
 import searchengine.model.SitePage;
-
 import searchengine.repositories.PageRepository;
 import searchengine.repositories.SiteRepository;
 import searchengine.services.IndexingService;
 import searchengine.services.LemmaService;
-import searchengine.services.IndexingService;
 
-import java.io.*;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -54,136 +51,154 @@ public class PageFinder extends RecursiveAction {
 
     @Override
     protected void compute() {
-        if (resultForkJoinPoolIndexedPages.get(page) != null || !indexingProcessing.get()) {
-            return;
-        }
-        Page indexingPage = new Page();
-        indexingPage.setPath(page);
-        indexingPage.setSiteId(siteDomain.getId());
+        if (isAlreadyProcessed(page)) return;
+
+        Page indexingPage = createPage(page, siteDomain);
 
         try {
-            org.jsoup.Connection connect = Jsoup.connect(siteDomain.getUrl() + page).userAgent(
-                    connection.getUserAgent()).referrer(connection.getReferer());
-            Document doc = connect.timeout(60000).get();
+            Document doc = fetchDocument(indexingPage);
 
-            indexingPage.setContent(doc.head() + String.valueOf(doc.body()));
-            if (indexingPage.getContent() == null || indexingPage.getContent().isEmpty() || indexingPage.getContent().isBlank()) {
-                throw new Exception(
-                        "Content of site id:" + indexingPage.getSiteId() + ", page:" + indexingPage.getPath() + " is null or empty");
-            }
-            Elements pages = doc.getElementsByTag("a");
-            for (org.jsoup.nodes.Element element : pages)
-                if (!element.attr("href").isEmpty() && element.attr("href").charAt(0) == '/') {
-                    if (resultForkJoinPoolIndexedPages.get(page) != null || !indexingProcessing.get()) {
-                        return;
-                    } else if (resultForkJoinPoolIndexedPages.get(element.attr("href")) == null) {
-                        urlSet.add(element.attr("href"));
-                    }
-                }
-            indexingPage.setCode(doc.connection().response().statusCode());
+            processPageContent(doc, indexingPage);
+            findAndProcessLinks(doc);
         } catch (Exception ex) {
-            errorHandling(ex, indexingPage);
-            resultForkJoinPoolIndexedPages.putIfAbsent(indexingPage.getPath(), indexingPage);
-            SitePage sitePage = siteRepository.findById(siteDomain.getId()).orElseThrow();
-            sitePage.setStatusTime(Timestamp.valueOf(LocalDateTime.now()));
-            siteRepository.save(sitePage);
-            pageRepository.save(indexingPage);
-            log.debug(
-                    "ERROR INDEXATION, siteId:" + indexingPage.getSiteId() + ", path:" + indexingPage.getPath() + ",code:" + indexingPage.getCode() + ", error:" + ex.getMessage());
-            return;
+            handleException(ex, indexingPage);
         }
-        if (resultForkJoinPoolIndexedPages.get(page) != null || !indexingProcessing.get()) {
-            return;
+
+        if (isAlreadyProcessed(page)) return;
+
+        saveIndexingPage(indexingPage);
+        processSubPages();
+    }
+
+    private boolean isAlreadyProcessed(String page) {
+        return resultForkJoinPoolIndexedPages.get(page) != null || !indexingProcessing.get();
+    }
+
+    private Page createPage(String pagePath, SitePage siteDomain) {
+        Page page = new Page();
+        page.setPath(pagePath);
+        page.setSiteId(siteDomain.getId());
+        return page;
+    }
+
+    private Document fetchDocument(Page page) throws Exception {
+        return Jsoup.connect(siteDomain.getUrl() + page.getPath())
+                .userAgent(connection.getUserAgent())
+                .referrer(connection.getReferer())
+                .timeout(60000)
+                .get();
+    }
+
+    private void processPageContent(Document doc, Page page) throws Exception {
+        String content = doc.head() + doc.body().toString();
+        if (content == null || content.isBlank()) {
+            throw new Exception("Content of site id:" + page.getSiteId() + ", page:" + page.getPath() + " is null or empty");
         }
-        resultForkJoinPoolIndexedPages.putIfAbsent(indexingPage.getPath(), indexingPage);
+
+        page.setContent(content);
+        page.setCode(doc.connection().response().statusCode());
+    }
+
+    private void findAndProcessLinks(Document doc) {
+        Elements pages = doc.getElementsByTag("a");
+        for (org.jsoup.nodes.Element element : pages) {
+            String href = element.attr("href");
+            if (!href.isEmpty() && href.charAt(0) == '/' && resultForkJoinPoolIndexedPages.get(href) == null) {
+                urlSet.add(href);
+            }
+        }
+    }
+
+    private void handleException(Exception ex, Page page) {
+        setPageErrorCode(page, ex);
+        savePageAndLogError(page, ex);
+    }
+
+    private void setPageErrorCode(Page page, Exception ex) {
+        String message = ex.toString();
+        int errorCode = determineErrorCode(message);
+        page.setCode(errorCode);
+    }
+
+    private int determineErrorCode(String message) {
+        if (message.contains("UnsupportedMimeTypeException")) return 415;
+        if (message.contains("Status=401")) return 401;
+        if (message.contains("UnknownHostException")) return 401;
+        if (message.contains("Status=403")) return 403;
+        if (message.contains("Status=404")) return 404;
+        if (message.contains("Status=500")) return 500;
+        if (message.contains("ConnectException: Connection refused")) return 500;
+        if (message.contains("SSLHandshakeException")) return 525;
+        if (message.contains("Status=503")) return 503;
+        return -1;
+    }
+
+    private void savePageAndLogError(Page page, Exception ex) {
         SitePage sitePage = siteRepository.findById(siteDomain.getId()).orElseThrow();
         sitePage.setStatusTime(Timestamp.valueOf(LocalDateTime.now()));
         siteRepository.save(sitePage);
-        pageRepository.save(indexingPage);
-        indexingService.indexHtml(indexingPage.getContent(), indexingPage);
-        List<PageFinder> indexingPagesTasks = new ArrayList<>();
+        pageRepository.save(page);
+        log.debug("ERROR INDEXATION, siteId:{}, path:{}, code:{}, error:{}", page.getSiteId(), page.getPath(), page.getCode(), ex.getMessage());
+    }
+
+    private void saveIndexingPage(Page page) {
+        resultForkJoinPoolIndexedPages.putIfAbsent(page.getPath(), page);
+        SitePage sitePage = siteRepository.findById(siteDomain.getId()).orElseThrow();
+        sitePage.setStatusTime(Timestamp.valueOf(LocalDateTime.now()));
+        siteRepository.save(sitePage);
+        pageRepository.save(page);
+        indexingService.indexHtml(page.getContent(), page);
+    }
+
+    private void processSubPages() {
+        List<PageFinder> tasks = new ArrayList<>();
         for (String url : urlSet) {
             if (resultForkJoinPoolIndexedPages.get(url) == null && indexingProcessing.get()) {
-                PageFinder task = new PageFinder(siteRepository, pageRepository, sitePage, url,
+                PageFinder task = new PageFinder(siteRepository, pageRepository, siteDomain, url,
                                                  resultForkJoinPoolIndexedPages, connection, lemmaService,
                                                  indexingService, indexingProcessing);
                 task.fork();
-                indexingPagesTasks.add(task);
+                tasks.add(task);
             }
         }
-        for (PageFinder page : indexingPagesTasks) {
-            if (!indexingProcessing.get()) {
-                return;
-            }
-            page.join();
-        }
+        joinTasks(tasks);
+    }
 
+    private void joinTasks(List<PageFinder> tasks) {
+        for (PageFinder task : tasks) {
+            if (!indexingProcessing.get()) return;
+            task.join();
+        }
     }
 
     public void refreshPage() {
-
-        Page indexingPage = new Page();
-        indexingPage.setPath(page);
-        indexingPage.setSiteId(siteDomain.getId());
+        Page page = createPage(this.page, siteDomain);
 
         try {
-            org.jsoup.Connection connect = Jsoup.connect(siteDomain.getUrl() + page).userAgent(
-                    connection.getUserAgent()).referrer(connection.getReferer());
-            Document doc = connect.timeout(60000).get();
-            indexingPage.setContent(doc.head() + String.valueOf(doc.body()));
-            indexingPage.setCode(doc.connection().response().statusCode());
-            if (indexingPage.getContent() == null || indexingPage.getContent().isEmpty() || indexingPage.getContent().isBlank()) {
-                throw new Exception(
-                        "Content of site id:" + indexingPage.getSiteId() + ", page:" + indexingPage.getPath() + " is null or empty");
-            }
+            Document doc = fetchDocument(page);
+            processPageContent(doc, page);
         } catch (Exception ex) {
-            errorHandling(ex, indexingPage);
-            SitePage sitePage = siteRepository.findById(siteDomain.getId()).orElseThrow();
-            sitePage.setStatusTime(Timestamp.valueOf(LocalDateTime.now()));
-            siteRepository.save(sitePage);
-            pageRepository.save(indexingPage);
+            handleException(ex, page);
             return;
         }
+
         SitePage sitePage = siteRepository.findById(siteDomain.getId()).orElseThrow();
         sitePage.setStatusTime(Timestamp.valueOf(LocalDateTime.now()));
         siteRepository.save(sitePage);
 
-        Page pageToRefresh = pageRepository.findPageBySiteIdAndPath(page, sitePage.getId());
-        if (pageToRefresh != null) {
-            pageToRefresh.setCode(indexingPage.getCode());
-            pageToRefresh.setContent(indexingPage.getContent());
-            pageRepository.save(pageToRefresh);
-            indexingService.refreshIndex(indexingPage.getContent(), pageToRefresh);
-        } else {
-            pageRepository.save(indexingPage);
-            indexingService.refreshIndex(indexingPage.getContent(), indexingPage);
-        }
+        Page existingPage = pageRepository.findPageBySiteIdAndPath(page.getPath(), sitePage.getId());
+        saveOrUpdatePage(existingPage, page);
     }
 
-    void errorHandling(Exception ex, Page indexingPage) {
-        String message = ex.toString();
-        int errorCode;
-        if (message.contains("UnsupportedMimeTypeException")) {
-            errorCode = 415;    // Ссылка на pdf, jpg, png документы
-        } else if (message.contains("Status=401")) {
-            errorCode = 401;    // На несуществующий домен
-        } else if (message.contains("UnknownHostException")) {
-            errorCode = 401;
-        } else if (message.contains("Status=403")) {
-            errorCode = 403;    // Нет доступа, 403 Forbidden
-        } else if (message.contains("Status=404")) {
-            errorCode = 404;    // // Ссылка на pdf-документ, несущ. страница, проигрыватель
-        } else if (message.contains("Status=500")) {
-            errorCode = 401;    // Страница авторизации
-        } else if (message.contains("ConnectException: Connection refused")) {
-            errorCode = 500;    // ERR_CONNECTION_REFUSED, не удаётся открыть страницу
-        } else if (message.contains("SSLHandshakeException")) {
-            errorCode = 525;
-        } else if (message.contains("Status=503")) {
-            errorCode = 503; // Сервер временно не имеет возможности обрабатывать запросы по техническим причинам (обслуживание, перегрузка и прочее).
+    private void saveOrUpdatePage(Page existingPage, Page newPage) {
+        if (existingPage != null) {
+            existingPage.setCode(newPage.getCode());
+            existingPage.setContent(newPage.getContent());
+            pageRepository.save(existingPage);
+            indexingService.refreshIndex(newPage.getContent(), existingPage);
         } else {
-            errorCode = -1;
+            pageRepository.save(newPage);
+            indexingService.refreshIndex(newPage.getContent(), newPage);
         }
-        indexingPage.setCode(errorCode);
     }
 }

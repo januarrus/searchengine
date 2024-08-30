@@ -8,7 +8,6 @@ import org.springframework.transaction.annotation.Transactional;
 import searchengine.model.IndexSearch;
 import searchengine.model.Lemma;
 import searchengine.model.Page;
-
 import searchengine.repositories.IndexSearchRepository;
 import searchengine.repositories.LemmaRepository;
 import searchengine.services.LemmaService;
@@ -33,9 +32,9 @@ public class PageIndexerServiceImpl implements IndexingService {
         try {
             Map<String, Integer> lemmas = lemmaService.getLemmasFromText(html);
             lemmas.entrySet().parallelStream().forEach(entry -> saveLemma(entry.getKey(), entry.getValue(), indexingPage));
-            log.debug("Индексация страницы " + (System.currentTimeMillis() - start) + " lemmas:" + lemmas.size());
+            log.debug("Индексация страницы заняла " + (System.currentTimeMillis() - start) + " мс, количество лемм: " + lemmas.size());
         } catch (IOException e) {
-            log.error(String.valueOf(e));
+            log.error("Ошибка при индексации HTML: ", e);
             throw new RuntimeException(e);
         }
     }
@@ -45,15 +44,12 @@ public class PageIndexerServiceImpl implements IndexingService {
         long start = System.currentTimeMillis();
         try {
             Map<String, Integer> lemmas = lemmaService.getLemmasFromText(html);
-            //уменьшение frequency у лемм которые присутствуют на обновляемой странице
             refreshLemma(refreshPage);
-            //удаление индекса
             indexSearchRepository.deleteAllByPageId(refreshPage.getId());
-            //обновление лемм и индесов у обнолвенной страницы
             lemmas.entrySet().parallelStream().forEach(entry -> saveLemma(entry.getKey(), entry.getValue(), refreshPage));
-            log.debug("Обновление индекса страницы " + (System.currentTimeMillis() - start) + " lemmas:" + lemmas.size());
+            log.debug("Обновление индекса страницы заняло " + (System.currentTimeMillis() - start) + " мс, количество лемм: " + lemmas.size());
         } catch (IOException e) {
-            log.error(String.valueOf(e));
+            log.error("Ошибка при обновлении индекса HTML: ", e);
             throw new RuntimeException(e);
         }
     }
@@ -61,50 +57,50 @@ public class PageIndexerServiceImpl implements IndexingService {
     @Transactional
     private void refreshLemma(Page refreshPage) {
         List<IndexSearch> indexes = indexSearchRepository.findAllByPageId(refreshPage.getId());
-        indexes.forEach(idx -> {
-            Optional<Lemma> lemmaToRefresh = lemmaRepository.findById(idx.getLemmaId());
+        indexes.forEach(index -> {
+            Optional<Lemma> lemmaToRefresh = lemmaRepository.findById(index.getLemmaId());
             lemmaToRefresh.ifPresent(lemma -> {
-                lemma.setFrequency(lemma.getFrequency() - idx.getLemmaCount());
+                lemma.setFrequency(lemma.getFrequency() - index.getLemmaCount());
                 lemmaRepository.saveAndFlush(lemma);
             });
         });
     }
 
     @Transactional
-    private void saveLemma(String k, Integer v, Page indexingPage) {
-        Lemma existLemmaInDB = lemmaRepository.lemmaExist(k, indexingPage.getSiteId());
-        if (existLemmaInDB != null) {
-            existLemmaInDB.setFrequency(existLemmaInDB.getFrequency() + v);
-            lemmaRepository.saveAndFlush(existLemmaInDB);
-            createIndex(indexingPage, existLemmaInDB, v);
+    private void saveLemma(String lemmaText, Integer frequency, Page page) {
+        Lemma existingLemma = lemmaRepository.lemmaExist(lemmaText, page.getSiteId());
+        if (existingLemma != null) {
+            existingLemma.setFrequency(existingLemma.getFrequency() + frequency);
+            lemmaRepository.saveAndFlush(existingLemma);
+            createIndex(page, existingLemma, frequency);
         } else {
             try {
-                Lemma newLemmaToDB = new Lemma();
-                newLemmaToDB.setSiteId(indexingPage.getSiteId());
-                newLemmaToDB.setLemma(k);
-                newLemmaToDB.setFrequency(v);
-                newLemmaToDB.setSitePage(indexingPage.getSitePage());
-                lemmaRepository.saveAndFlush(newLemmaToDB);
-                createIndex(indexingPage, newLemmaToDB, v);
+                Lemma newLemma = new Lemma();
+                newLemma.setSiteId(page.getSiteId());
+                newLemma.setLemma(lemmaText);
+                newLemma.setFrequency(frequency);
+                newLemma.setSitePage(page.getSitePage());
+                lemmaRepository.saveAndFlush(newLemma);
+                createIndex(page, newLemma, frequency);
             } catch (DataIntegrityViolationException ex) {
-                log.debug("Ошибка при сохранении леммы, такая лемма уже существует. Вызов повторного сохранения");
-                saveLemma(k, v, indexingPage);
+                log.debug("Ошибка при сохранении леммы. Попробую снова.", ex);
+                saveLemma(lemmaText, frequency, page);
             }
         }
     }
 
-    private void createIndex(Page indexingPage, Lemma lemmaInDB, Integer rank) {
-        IndexSearch indexSearchExist = indexSearchRepository.indexSearchExist(indexingPage.getId(), lemmaInDB.getId());
-        if (indexSearchExist != null) {
-            indexSearchExist.setLemmaCount(indexSearchExist.getLemmaCount() + rank);
-            indexSearchRepository.save(indexSearchExist);
+    private void createIndex(Page page, Lemma lemma, Integer rank) {
+        IndexSearch existingIndex = indexSearchRepository.indexSearchExist(page.getId(), lemma.getId());
+        if (existingIndex != null) {
+            existingIndex.setLemmaCount(existingIndex.getLemmaCount() + rank);
+            indexSearchRepository.save(existingIndex);
         } else {
             IndexSearch index = new IndexSearch();
-            index.setPageId(indexingPage.getId());
-            index.setLemmaId(lemmaInDB.getId());
+            index.setPageId(page.getId());
+            index.setLemmaId(lemma.getId());
             index.setLemmaCount(rank);
-            index.setLemma(lemmaInDB);
-            index.setPage(indexingPage);
+            index.setLemma(lemma);
+            index.setPage(page);
             indexSearchRepository.save(index);
         }
     }

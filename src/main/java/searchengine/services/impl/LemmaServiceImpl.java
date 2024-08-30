@@ -1,6 +1,5 @@
 package searchengine.services.impl;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.lucene.morphology.LuceneMorphology;
 import org.apache.lucene.morphology.WrongCharaterException;
@@ -18,58 +17,94 @@ import java.util.Map;
 @Service
 @Slf4j
 public class LemmaServiceImpl implements LemmaService {
-    private LuceneMorphology luceneMorphology;
+    private final LuceneMorphology luceneMorphology;
 
-    {
+    public LemmaServiceImpl() {
+        this.luceneMorphology = initializeMorphology();
+    }
+
+    private LuceneMorphology initializeMorphology() {
         try {
-            luceneMorphology = new RussianLuceneMorphology();
+            return new RussianLuceneMorphology();
         } catch (IOException e) {
-            e.printStackTrace();
+            log.error("Failed to initialize RussianLuceneMorphology", e);
+            throw new RuntimeException("Failed to initialize RussianLuceneMorphology", e);
         }
     }
 
     @Override
     public Map<String, Integer> getLemmasFromText(String html) {
         Map<String, Integer> lemmasInText = new HashMap<>();
-
-        String text = Jsoup.parse(html).text();
-        List<String> words = new ArrayList<>(List.of(text.toLowerCase().split("[^a-zа-я]+")));
-        words.forEach(w -> determineLemma(w, lemmasInText));
+        String text = extractTextFromHtml(html);
+        List<String> words = extractWordsFromText(text);
+        words.forEach(word -> determineLemma(word, lemmasInText));
         return lemmasInText;
+    }
+
+    private String extractTextFromHtml(String html) {
+        return Jsoup.parse(html).text();
+    }
+
+    private List<String> extractWordsFromText(String text) {
+        return new ArrayList<>(List.of(text.toLowerCase().split("[^a-zа-я]+")));
     }
 
     @Override
     public String getLemmaByWord(String word) {
         String preparedWord = word.toLowerCase();
         if (checkMatchWord(preparedWord)) return "";
+
+        return extractLemma(preparedWord);
+    }
+
+    private String extractLemma(String word) {
         try {
-            List<String> normalWordForms = luceneMorphology.getNormalForms(preparedWord);
-            String wordInfo = luceneMorphology.getMorphInfo(preparedWord).toString();
+            List<String> normalWordForms = luceneMorphology.getNormalForms(word);
+            String wordInfo = getWordInfo(word);
             if (checkWordInfo(wordInfo)) return "";
             return normalWordForms.get(0);
         } catch (WrongCharaterException ex) {
-            log.debug(ex.getMessage());
+            log.debug("Error processing word '{}': {}", word, ex.getMessage());
         }
         return "";
     }
 
+    private String getWordInfo(String word) {
+        return luceneMorphology.getMorphInfo(word).toString();
+    }
+
     private void determineLemma(String word, Map<String, Integer> lemmasInText) {
         try {
-            if (checkMatchWord(word)) {
-                return;
-            }
-            List<String> normalWordForms = luceneMorphology.getNormalForms(word);
-            String wordInfo = luceneMorphology.getMorphInfo(word).toString();
-            if (checkWordInfo(wordInfo)) return;
-            String normalWord = normalWordForms.get(0);
-            lemmasInText.put(normalWord, lemmasInText.containsKey(normalWord) ? (lemmasInText.get(normalWord) + 1) : 1);
+            if (checkMatchWord(word)) return;
+
+            String normalWord = getNormalFormOfWord(word);
+            incrementLemmaCount(normalWord, lemmasInText);
         } catch (RuntimeException ex) {
-            log.debug(ex.getMessage());
+            log.debug("Error processing word '{}': {}", word, ex.getMessage());
         }
     }
 
+    private String getNormalFormOfWord(String word) {
+        List<String> normalWordForms = luceneMorphology.getNormalForms(word);
+        String wordInfo = getWordInfo(word);
+        if (checkWordInfo(wordInfo)) return "";
+        return normalWordForms.get(0);
+    }
+
+    private void incrementLemmaCount(String lemma, Map<String, Integer> lemmasInText) {
+        lemmasInText.put(lemma, lemmasInText.getOrDefault(lemma, 0) + 1);
+    }
+
     private boolean checkMatchWord(String word) {
-        return word.isEmpty() || String.valueOf(word.charAt(0)).matches("[a-z]") || String.valueOf(word.charAt(0)).matches("[0-9]");
+        return word.isEmpty() || isEnglishWord(word) || isNumeric(word);
+    }
+
+    private boolean isEnglishWord(String word) {
+        return String.valueOf(word.charAt(0)).matches("[a-z]");
+    }
+
+    private boolean isNumeric(String word) {
+        return String.valueOf(word.charAt(0)).matches("[0-9]");
     }
 
     private boolean checkWordInfo(String wordInfo) {
